@@ -1,0 +1,56 @@
+[project]
+name = "mrPlanarVolumes"
+version = "0.1.0"
+description = "Meshroom plugin: a clean, low-poly layout of a tracked or photogrammetry scene (walls, floors, openings, stairs) from the SfM, monocular depth (MoGe-2) and the dense mesh."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MPL-2.0"}
+authors = [{name = "Balthazar Sahel"}]
+dependencies = [
+    "numpy<2", # pyalicevision is built against NumPy 1.x.
+    "opencv-python>=4.8,<5", # same distribution as MoGe (two OpenCV wheels would clash)
+    "scipy>=1.10",
+    "torch>=2.6,<2.8",
+    "torchvision>=0.21,<0.23",
+    "moge",
+]
+
+# Meshroom discovers the node from MESHROOM_PLUGINS_PATH, not site-packages.
+# uv only installs the plugin's dependencies into its venv.
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+# MoGe-2 (normals): last MoGe-2 commit. MoGe-3 requires NumPy 2 (pyalicevision is built against NumPy 1.x), and the
+# meshroomHubWarehouse fork used by mrDepthEstimation is MoGe-1 only.
+moge = { git = "https://github.com/microsoft/MoGe.git", rev = "07444410f1e33f402353b99d6ccd26bd31e469e8" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[dependency-groups]
+dev = ["pytest", "flake8"]
+
+[tool.meshroom]
+requirements = "Nvidia GPU with a driver supporting CUDA 12.6 for the monocular depth step (MoGe-2); the other steps run on the CPU."
+env = [
+    { key = "PLANARVOLUMES_MOGE_MODEL", type = "path", value = "weights/moge-2-vitl-normal.pt" },
+]
+
+[[tool.meshroom.assets]]
+name = "MoGe-2_ViT-L_normal"
+category = "Weights"
+path = "weights/moge-2-vitl-normal.pt"
+url = "https://huggingface.co/Ruicheng/moge-2-vitl-normal/resolve/cb0e8bbd6b1e243589717c78e750b1ba4c093acf/model.pt"
+sha256 = "280741fd09bc3f403ccff9967784c2a391b52d2c0742ae3efdb21d9f90cc1a01"
+sizeMB = 1263
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.flake8]
+max-line-length = 127
