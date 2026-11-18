@@ -31,6 +31,8 @@ COS35 = np.cos(np.radians(35))
 SEE_THROUGH = 0.4    # seen-through fraction of the footprint above which an unverified wall is dropped
 DENSE_MIN = 0.15     # smallest dense coverage (occupied cells / footprint) of an unverified wall
 DENSE_BAND = 0.2     # half thickness of the band around a plane (u)
+DENSE_COS = np.cos(np.radians(30))   # dense surface points oriented like the plane
+DENSE_PLANARITY = 0.1                # smallest / middle PCA eigenvalue of a planar neighbourhood
 EXTEND_MIN = 0.5     # smallest dense coverage of a wall to extend it
 EXT_STEP, EXT_MAX = 0.5, 2.0   # extension step and maximum length (u)
 # floors under the camera path
@@ -41,7 +43,8 @@ FLOOR_MIN_CAMERAS = 0.05    # smallest level: fraction of the cameras of the dom
 FLOOR_WALL_GAP = 1.5        # a wall whose measured bottom is up to this much above a floor still bounds it (u)
 FLOOR_MIN_EYE = 0.6         # a level with the camera less than this fraction of its height above the main floor: furniture
 FLOOR_MIN_AREA = 1.0        # smallest floor rectangle (u2)
-FLOOR_MIN_WIDTH = 0.5       # thinnest floor rectangle (u)
+FLOOR_MIN_WIDTH = 1.0       # thinnest floor rectangle (u)
+FLOOR_STAIRS_MARGIN = 0.3   # the stairs footprint (+ margin, u) is not a floor
 INPLANE = {"F": ("S", "U"), "S": ("F", "U"), "U": ("S", "F")}     # (horizontal b, a) axes of each plane axis
 
 
@@ -59,6 +62,24 @@ class Frame:
         """(normal, b, a) unit vectors of a plane of the given axis."""
         b, a = INPLANE[axis]
         return self.axes[axis], self.axes[b], self.axes[a]
+
+
+def planarPoints(points, voxel=0.05, k=16):
+    """Locally planar points of a dense surface and their normals (voxel subsampling, PCA of the k nearest points);
+    foliage and clutter are not planar.
+
+    Returns:
+        tuple: points (m, 3), unit normals (m, 3).
+    """
+    from scipy.spatial import cKDTree
+    key = np.floor(points / voxel).astype(np.int64)
+    _, first = np.unique(key, axis=0, return_index=True)
+    P = points[np.sort(first)]
+    _, nn = cKDTree(P).query(P, k=min(k, len(P)), workers=-1)
+    Q = P[nn] - P[nn].mean(1, keepdims=True)
+    w, vec = np.linalg.eigh(np.einsum("nki,nkj->nij", Q, Q))
+    planar = w[:, 0] < DENSE_PLANARITY * w[:, 1]
+    return P[planar], vec[planar, :, 0]
 
 
 def _overlapArea(r1, r2):
@@ -113,6 +134,9 @@ class LargePlanes:
     def __init__(self, scene, work, domains, refiner, densePoints=None, log=print):
         self.scene, self.work, self.domains, self.refiner, self.log = scene, work, domains, refiner, log
         self.dense = densePoints
+        self.denseNormals = None
+        if densePoints is not None:                      # wall surface = locally planar dense points (not foliage)
+            self.densePlanar, self.denseNormals = planarPoints(densePoints)
         self.sources = []
         for k, (name, fmin, fmax, interior) in enumerate(domains):
             with open(os.path.join(work, name, "final.pkl"), "rb") as f:
@@ -257,11 +281,15 @@ class LargePlanes:
 
     # --- 5. ghost walls and extension along the dense surface
     def _onPlane(self, pl):
-        """Dense vertices in the band of a plane -> (b, a) coordinates."""
+        """Dense surface points in the band of a plane and oriented like it -> (b, a) coordinates."""
         A, B, Av = self.frame.of(pl["axis"])
-        b, a = self.dense @ B, self.dense @ Av
+        normals = getattr(self, "denseNormals", None)
+        P = self.densePlanar if normals is not None else self.dense
+        b, a = P @ B, P @ Av
         d = pl["off"] + pl["yaw"] * (b - pl.get("yaw_c", 0.0))
-        k = np.abs(self.dense @ A - d) < DENSE_BAND
+        k = np.abs(P @ A - d) < DENSE_BAND
+        if normals is not None:
+            k &= np.abs(normals @ A) > DENSE_COS
         return b[k], a[k]
 
     @staticmethod
@@ -280,16 +308,20 @@ class LargePlanes:
         return sum(max(0, min(c[1], b1) - max(c[0], b0)) * max(0, min(c[3], a1) - max(c[2], a0)) for c in pl["cuts"]) / area
 
     def _removeGhosts(self, planes):
+        """Outdoor walls in foliage: an unverified wall mostly seen through, or (with the dense mesh) any outdoor wall
+        without dense surface on its plane: a weak photometric validation on foliage is not enough."""
         keep = []
         for pl in planes:
-            if pl["axis"] == "U" or pl["dom"] != "exterior" or pl["src"] != "measured":
+            if pl["axis"] == "U" or pl["dom"] != "exterior":
                 keep.append(pl)
                 continue
+            unverified = pl["src"] == "measured"
             seen = self._cutFraction(pl)
             cov = self._coverage(*self._onPlane(pl), pl["rect"]) if self.dense is not None else None
-            if seen > SEE_THROUGH or (cov is not None and cov < DENSE_MIN):
-                self.log("wall %s %.2f dropped (unverified; seen through %.0f %%%s)" % (
-                    pl["axis"], pl["off"], 100 * seen, "" if cov is None else ", dense coverage %.0f %%" % (100 * cov)))
+            if (unverified and seen > SEE_THROUGH) or (cov is not None and cov < DENSE_MIN):
+                self.log("wall %s %.2f dropped (%s; seen through %.0f %%%s)" % (
+                    pl["axis"], pl["off"], "unverified" if unverified else "photo", 100 * seen,
+                    "" if cov is None else ", dense coverage %.0f %%" % (100 * cov)))
                 continue
             keep.append(pl)
         return keep
@@ -403,7 +435,7 @@ class LargePlanes:
                            support=0, dom="exterior", frames=[], yaw=0.0, src="stairs", name="ground", cuts=[]))
 
     # --- 7b. floors under the cameras
-    def _floors(self, planes):
+    def _floors(self, planes, stairs=None):
         """Floors where the camera walks: height map of the lowest points (track + dense mesh) around the camera path
         of each domain; the levels are the heights found right under the cameras (furniture is walked around, not
         on); one rectangle per zone of a level connected to the camera positions.
@@ -418,6 +450,11 @@ class LargePlanes:
         if self.dense is not None:
             points = np.r_[self.dense, points]
         q, h = np.c_[points @ F, points @ S], points @ U
+        stairsBox = None
+        if stairs is not None:
+            V = np.concatenate([qd["V"] for qd in stairs["quads"]])
+            m = FLOOR_STAIRS_MARGIN
+            stairsBox = ((V @ F).min() - m, (V @ F).max() + m, (V @ S).min() - m, (V @ S).max() + m)
         found = []
         for name, fmin, fmax, interior in sorted(self.domains, key=lambda d: not d[3]):     # indoor domains first
             dom = "interior" if interior else "exterior"
@@ -428,6 +465,9 @@ class LargePlanes:
             d, j = cKDTree(c2).query(q, distance_upper_bound=FLOOR_RADIUS)
             k = np.isfinite(d)
             k[k] &= h[k] < ch[j[k]] - FLOOR_BELOW_CAMERA
+            if stairsBox is not None:                    # walking down the stairs: their steps are not floors
+                k &= ~((q[:, 0] > stairsBox[0]) & (q[:, 0] < stairsBox[1])
+                       & (q[:, 1] > stairsBox[2]) & (q[:, 1] < stairsBox[3]))
             if k.sum() < 100:
                 continue
             qk, hk = q[k], h[k]
@@ -619,7 +659,7 @@ class LargePlanes:
             self._extendAlongDense(planes)
         stairs = loadStairs(self.work)
         self._levels(planes, stairs)
-        self._floors(planes)
+        self._floors(planes, stairs)
         self._joints(planes)
         quads = self._quads(planes)
         result = dict(quads=quads, up=self.frame.axes["U"], frame=dict(self.frame.axes),
